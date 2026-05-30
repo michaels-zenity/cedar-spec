@@ -54,13 +54,13 @@ pub enum ExecError {
     FileReadError {
         content_type: ContentType,
         file_name: PathBuf,
-        error: Box<dyn std::error::Error>,
+        error: Box<dyn std::error::Error + Send + Sync>,
     },
     #[error("Error parsing {content_type:?} from {file_name} : {error}")]
     ParseError {
         content_type: ContentType,
         file_name: PathBuf,
-        error: Box<dyn std::error::Error>,
+        error: Box<dyn std::error::Error + Send + Sync>,
     },
     #[error(
         "Error while attempting to use id annotations as policy ids in while parsing {content_type:?} from {file_name}: {error}"
@@ -79,20 +79,20 @@ pub enum ExecError {
     EntityTypeError {
         entity_type: EntityType,
         input_str: String,
-        error: Box<dyn std::error::Error>,
+        error: Box<dyn std::error::Error + Send + Sync>,
     },
     #[error("Error Creating {element:?} from {input_str} : {error}")]
     RequestError {
         element: RequestElement,
         input_str: String,
-        error: Box<dyn std::error::Error>,
+        error: Box<dyn std::error::Error + Send + Sync>,
     },
     #[error("Error converting Policy to a PolicySet : {error}")]
-    PolicyIntoPolicySetError { error: Box<dyn std::error::Error> },
+    PolicyIntoPolicySetError { error: Box<dyn std::error::Error + Send + Sync> },
     #[error("Error during analysis : {error}")]
-    InternalAnalysisError { error: Box<dyn std::error::Error> },
+    InternalAnalysisError { error: Box<dyn std::error::Error + Send + Sync> },
     #[error("Error Creating Request : {error}")]
-    RequestValidationError { error: Box<dyn std::error::Error> },
+    RequestValidationError { error: Box<dyn std::error::Error + Send + Sync> },
     #[error("Could not fetch actions from Schema")]
     ActionsFromSchemaError(#[from] Box<EntitiesError>),
     #[error("{principal_type} cannot {action_name} on {resource_type} in the provided Schema")]
