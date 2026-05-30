@@ -81,8 +81,8 @@ theorem or_not_euid_via_path {e₁ e₂: Expr} {entities : Entities} {path : Lis
 := by
   intro ha
   simp only [evaluate] at he
-  cases he₁ : Result.as Bool (evaluate e₁ request entities) <;>
-    simp only [he₁, bind_pure_comp, Except.bind_err, Except.bind_ok, reduceCtorEq] at he
+  simp_do_let Result.as Bool (evaluate e₁ request entities) as he₁ at he
+  simp only [bind_pure_comp] at he
   split at he
   · simp only [Except.ok.injEq] at he
     subst he ; cases ha
@@ -96,8 +96,8 @@ theorem unary_not_euid_via_path {op : UnaryOp} {e₁ : Expr} {entities : Entitie
 := by
   intro ha
   simp only [evaluate] at he
-  cases he₁ : evaluate e₁ request entities <;>
-    simp only [he₁, intOrErr, apply₁, Except.bind_err, Except.bind_ok, reduceCtorEq] at he
+  simp_do_let evaluate e₁ request entities as he₁ at he
+  simp only [intOrErr, apply₁] at he
   (split at he <;> try split at he) <;>
   try simp only [reduceCtorEq] at he
   all_goals
@@ -206,7 +206,7 @@ theorem checked_eval_entity_reachable {e : Expr} {n nmax: Nat} {c c' : Capabilit
     have ih : ∀ a x, (Map.make rxs).find? a = some x → CheckedEvalEntityReachable x := by
       intros a x hfx
       have : sizeOf x < sizeOf (Expr.record rxs) := by
-        replace he := Map.make_mem_list_mem (Map.find?_mem_toList hfx)
+        replace he := Map.mem_make_mem_list (Map.find?_mem_toList hfx)
         have h₁ := List.sizeOf_lt_of_mem he
         rw [Prod.mk.sizeOf_spec a x] at h₁
         simp only [Expr.record.sizeOf_spec, gt_iff_lt]

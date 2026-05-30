@@ -24,6 +24,7 @@ use rayon::prelude::*;
 use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write;
 
 thread_local! {
     /// Per-OS-thread Lean runtime handle. `lean_initialize_thread` (run inside
@@ -322,7 +323,7 @@ pub(crate) struct PerSigFindings {
     pub(crate) equiv_classes: Vec<HashSet<PolicyId>>,
     pub(crate) permit_shadowed_by_permits: HashMap<PolicyId, HashSet<PolicyId>>,
     pub(crate) forbid_shadowed_by_forbids: HashMap<PolicyId, HashSet<PolicyId>>,
-    pub(crate) permit_overriden_by_forbids: HashMap<PolicyId, HashSet<PolicyId>>,
+    pub(crate) permit_overridden_by_forbids: HashMap<PolicyId, HashSet<PolicyId>>,
 }
 
 impl PerSigFindings {
@@ -331,7 +332,7 @@ impl PerSigFindings {
         mut equiv_results: HashMap<PolicyId, HashSet<PolicyId>>,
         permit_shadowed_by_permits: HashMap<PolicyId, HashSet<PolicyId>>,
         forbid_shadowed_by_forbids: HashMap<PolicyId, HashSet<PolicyId>>,
-        permit_overriden_by_forbids: HashMap<PolicyId, HashSet<PolicyId>>,
+        permit_overridden_by_forbids: HashMap<PolicyId, HashSet<PolicyId>>,
     ) -> Self {
         let mut equiv_classes = Vec::new();
         while !equiv_results.is_empty() {
@@ -358,7 +359,7 @@ impl PerSigFindings {
             equiv_classes,
             permit_shadowed_by_permits,
             forbid_shadowed_by_forbids,
-            permit_overriden_by_forbids,
+            permit_overridden_by_forbids,
         }
     }
 
@@ -367,7 +368,7 @@ impl PerSigFindings {
         for (_, s) in self.permit_shadowed_by_permits.iter() {
             ret += s.len();
         }
-        for (_, s) in self.permit_overriden_by_forbids.iter() {
+        for (_, s) in self.permit_overridden_by_forbids.iter() {
             ret += s.len();
         }
         for (_, s) in self.forbid_shadowed_by_forbids.iter() {
@@ -391,8 +392,8 @@ impl AnalyzePolicyFindings {
         policy_vacuity_results: HashMap<PolicyId, Vec<VacuityResult>>,
         redundant_findings: HashMap<PolicyId, Vec<HashSet<PolicyId>>>,
         permit_shadowed_by_permit_findings: HashMap<PolicyId, Vec<HashSet<PolicyId>>>,
-        permit_overriden_by_forbid_findings: HashMap<PolicyId, Vec<HashSet<PolicyId>>>,
-        forbid_shadowed_by_forbid_findigns: HashMap<PolicyId, Vec<HashSet<PolicyId>>>,
+        permit_overridden_by_forbid_findings: HashMap<PolicyId, Vec<HashSet<PolicyId>>>,
+        forbid_shadowed_by_forbid_findings: HashMap<PolicyId, Vec<HashSet<PolicyId>>>,
     ) -> Self {
         let vacuous_result = vacuous_finding_from_results(&vacuous_results);
         let vacuous_policies: HashMap<PolicyId, VacuityResult> = policy_vacuity_results
@@ -419,16 +420,16 @@ impl AnalyzePolicyFindings {
                 sig_permit_shadowed_findings.insert(pid.clone(), ppss.clone());
             }
 
-            let mut sig_permit_overriden_findings = HashMap::new();
-            for (pid, pofr) in permit_overriden_by_forbid_findings.iter() {
+            let mut sig_permit_overridden_findings = HashMap::new();
+            for (pid, pofr) in permit_overridden_by_forbid_findings.iter() {
                 let pofs = pofr
                     .get(ind)
                     .expect("Overriding for policy not precomputed for signature");
-                sig_permit_overriden_findings.insert(pid.clone(), pofs.clone());
+                sig_permit_overridden_findings.insert(pid.clone(), pofs.clone());
             }
 
             let mut sig_forbid_shadowed_findings = HashMap::new();
-            for (pid, fsr) in forbid_shadowed_by_forbid_findigns.iter() {
+            for (pid, fsr) in forbid_shadowed_by_forbid_findings.iter() {
                 let fss = fsr
                     .get(ind)
                     .expect("Shadowing for policy not precomputed for signature");
@@ -440,7 +441,7 @@ impl AnalyzePolicyFindings {
                 sig_redundant_findings,
                 sig_permit_shadowed_findings,
                 sig_forbid_shadowed_findings,
-                sig_permit_overriden_findings,
+                sig_permit_overridden_findings,
             );
 
             // if there was actually something for this signature
@@ -521,12 +522,12 @@ impl AnalyzePolicyFindings {
                 }
             }
             for (pid, overriders) in sig_finding
-                .permit_overriden_by_forbids
+                .permit_overridden_by_forbids
                 .iter()
                 .sorted_by_key(|(pid, _)| pid.to_string())
             {
                 for opid in overriders.iter().sorted_by_key(|pid| pid.to_string()) {
-                    let result_str = format!("Policy `{pid}` overriden by `{opid}`");
+                    let result_str = format!("Policy `{pid}` overridden by `{opid}`");
                     per_env_result_strs.push(result_str);
                 }
             }
@@ -558,16 +559,16 @@ impl AnalyzePolicyFindings {
 }
 
 fn ids_comma_sep(pids: &HashSet<PolicyId>) -> String {
-    let mut ret = "".into();
-    for (ind, pid) in pids.iter().sorted_by_key(|pid| pid.to_string()).enumerate() {
+    let mut ret = String::new();
+    for (ind, pid) in pids.iter().sorted().enumerate() {
         if ind == 0 {
-            ret = format!("`{pid}`");
+            let _ = write!(&mut ret, "`{pid}`");
         } else if pids.len() == 2 {
-            ret = format!("{ret} and `{pid}`");
+            let _ = write!(&mut ret, " and `{pid}`");
         } else if ind + 1 != pids.len() {
-            ret = format!("{ret}, `{pid}`");
+            let _ = write!(&mut ret, ", `{pid}`");
         } else {
-            ret = format!("`{ret}`, and `{pid}`")
+            let _ = write!(&mut ret, ", and `{pid}`");
         }
     }
     ret
@@ -652,7 +653,7 @@ enum ShadowingResult {
 }
 
 impl<'a> Analyzer<'a> {
-    /// Compute Redudant and Shadowed relationship between `policy1` and `policy2` (per environment)
+    /// Compute Redundant and Shadowed relationship between `policy1` and `policy2` (per environment)
     fn compute_permit_shadowing_result(
         &self,
         policy1: &Policy,
@@ -862,7 +863,7 @@ fn display_entity(
         write!(f, " in [{ancs}]", ancs = ancs.iter().join(", "))?;
     }
     if let Some(attrs) = NonEmpty::collect(edata.attrs.iter()) {
-        write!(f, " {{\n")?;
+        writeln!(f, " {{")?;
         for (k, v) in attrs.iter() {
             if cedar_policy_core::ast::is_normalized_ident(k) {
                 write!(f, "{prefix}  {k}: ")?;
@@ -870,12 +871,12 @@ fn display_entity(
                 write!(f, "{prefix}  \"{}\": ", k.escape_debug())?;
             }
             display_value(f, v)?;
-            write!(f, ",\n")?;
+            writeln!(f, ",")?;
         }
         write!(f, "{prefix}}}")?;
     }
     if let Some(tags) = NonEmpty::collect(edata.tags.iter()) {
-        write!(f, " tags {{\n")?;
+        writeln!(f, " tags {{")?;
         for (k, v) in tags.iter() {
             if cedar_policy_core::ast::is_normalized_ident(k) {
                 write!(f, "{prefix}  {k}: ")?;
@@ -883,7 +884,7 @@ fn display_entity(
                 write!(f, "{prefix}  \"{}\": ", k.escape_debug())?;
             }
             display_value(f, v)?;
-            write!(f, ",\n")?;
+            writeln!(f, ",")?;
         }
         write!(f, "{prefix}}}")?;
     }
@@ -924,7 +925,7 @@ impl std::fmt::Display for ExampleEnv {
                         write!(f, "  \"{}\": ", k.escape_debug())?;
                     }
                     display_value(f, v)?;
-                    write!(f, ",\n")?;
+                    writeln!(f, ",")?;
                 }
                 write!(f, "}}")?;
             }
@@ -1015,7 +1016,7 @@ fn print_compare_results(results: &[PolicySetComparisonResult]) {
 impl<'a> Analyzer<'a> {
     /// Compare `pset1` to `pset2` and print results
     pub fn compare_policysets(&self, pset1: PolicySet, pset2: PolicySet) -> Result<(), ExecError> {
-        let req_envs = OpenRequestEnv::any().to_request_envs(&self.schema)?;
+        let req_envs = OpenRequestEnv::any().to_request_envs(self.schema)?;
         let comparison_results: Vec<PolicySetComparisonResult> = req_envs
             .par_iter()
             .map(|req_env| -> Result<PolicySetComparisonResult, ExecError> {
