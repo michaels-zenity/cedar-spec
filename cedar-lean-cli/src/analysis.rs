@@ -26,56 +26,112 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 thread_local! {
-    /// Per-OS-thread Lean context. The Lean runtime is single-threaded per
-    /// thread: each worker must call `lean_initialize_thread` (done inside
-    /// `CedarLeanFfi::new`) and own its `LeanSchema`, since neither is `Send`.
-    /// Created on first use per thread and reused; no Lean object crosses a
-    /// thread boundary, so the per-thread schema clones are race-free.
-    static LEAN_TLS: RefCell<Option<(CedarLeanFfi, LeanSchema)>> = const { RefCell::new(None) };
+    /// Per-OS-thread Lean runtime handle. `lean_initialize_thread` (run inside
+    /// `CedarLeanFfi::new`) must execute on each worker thread before any FFI
+    /// call, so the handle is created lazily once per thread and reused. The
+    /// schema is shared across threads separately (see `SharedSchema`), not
+    /// stored here, so a later analyzer with a different schema cannot reuse it.
+    static LEAN_FFI: RefCell<Option<CedarLeanFfi>> = const { RefCell::new(None) };
 }
 
-/// Runs `f` with the calling thread's own `CedarLeanFfi` and `LeanSchema`,
-/// initializing them on first use.
-fn with_lean<R>(
-    schema: &Schema,
-    f: impl FnOnce(&CedarLeanFfi, &LeanSchema) -> Result<R, FfiError>,
-) -> Result<R, FfiError> {
-    LEAN_TLS.with(|cell| {
+/// Runs `f` with the calling thread's `CedarLeanFfi`, initializing it on first use.
+fn with_ffi<R>(f: impl FnOnce(&CedarLeanFfi) -> Result<R, FfiError>) -> Result<R, FfiError> {
+    LEAN_FFI.with(|cell| {
         if cell.borrow().is_none() {
-            let ffi = CedarLeanFfi::new();
-            let lean_schema = ffi.load_lean_schema_object(schema)?;
-            *cell.borrow_mut() = Some((ffi, lean_schema));
+            *cell.borrow_mut() = Some(CedarLeanFfi::new());
         }
         let slot = cell.borrow();
-        let (ffi, lean_schema) = slot.as_ref().expect("lean ctx just initialized");
-        f(ffi, lean_schema)
+        f(slot.as_ref().expect("ffi just initialized"))
     })
 }
 
-/// Per-pair analysis result, produced in parallel and merged sequentially.
-enum PairFindings {
-    PermitPermit(PolicyId, PolicyId, Vec<ShadowingResult>),
-    /// (permit_id, forbid_id, per-request-env override results)
-    PermitOverride(PolicyId, PolicyId, Vec<OverrideResult>),
-    ForbidForbid(PolicyId, PolicyId, Vec<ShadowingResult>),
+/// A `LeanSchema` shared by reference across rayon worker threads. The wrapped
+/// schema is marked persistent in `Analyzer::new`, so its Lean reference count is
+/// frozen and the graph is never freed; that is what makes cross-thread sharing
+/// sound, since the FFI's by-value `LeanSchema` arguments would otherwise mutate
+/// a non-atomic refcount on every call.
+struct SharedSchema(LeanSchema);
+
+// SAFETY: the contained schema is marked persistent before the `SharedSchema` is
+// constructed, hence before any other thread can observe it. Persistent Lean
+// objects are never mutated by reference-count operations and never freed, so
+// shared references and the owned clones taken per FFI call are race-free.
+unsafe impl Send for SharedSchema {}
+unsafe impl Sync for SharedSchema {}
+
+/// Per-request-environment findings accumulated across policy pairs. Each map is
+/// `policy |-> [env_0, .., env_{E-1}]`; `p2` in entry `env_i` of `p1` records a
+/// relationship between `p1` and `p2` for that request environment. Built per
+/// rayon worker via `fold` and combined with `merge`, so no intermediate per-pair
+/// result is retained.
+#[derive(Default)]
+struct Findings {
+    redundant: HashMap<PolicyId, Vec<HashSet<PolicyId>>>,
+    permit_shadowed: HashMap<PolicyId, Vec<HashSet<PolicyId>>>,
+    permit_overridden: HashMap<PolicyId, Vec<HashSet<PolicyId>>>,
+    forbid_shadowed: HashMap<PolicyId, Vec<HashSet<PolicyId>>>,
+}
+
+impl Findings {
+    fn merge(&mut self, other: Findings) {
+        merge_findings(&mut self.redundant, other.redundant);
+        merge_findings(&mut self.permit_shadowed, other.permit_shadowed);
+        merge_findings(&mut self.permit_overridden, other.permit_overridden);
+        merge_findings(&mut self.forbid_shadowed, other.forbid_shadowed);
+    }
+}
+
+/// Unions `from` into `into` index-wise; every per-policy vector has one entry
+/// per request environment, so entries are combined by position.
+fn merge_findings(
+    into: &mut HashMap<PolicyId, Vec<HashSet<PolicyId>>>,
+    from: HashMap<PolicyId, Vec<HashSet<PolicyId>>>,
+) {
+    for (pid, envs) in from {
+        match into.get_mut(&pid) {
+            Some(existing) => {
+                debug_assert_eq!(existing.len(), envs.len());
+                for (slot, set) in existing.iter_mut().zip(envs) {
+                    slot.extend(set);
+                }
+            }
+            None => {
+                into.insert(pid, envs);
+            }
+        }
+    }
 }
 
 pub struct Analyzer<'a> {
     /// Rust schema object
     schema: &'a Schema,
+    /// Persistent Lean schema, shared by reference across worker threads
+    lean_schema: SharedSchema,
     /// Whether to output in JSON
     json_output: bool,
 }
 
 impl<'a> Analyzer<'a> {
     pub fn new(schema: &'a Schema, json_output: bool) -> Result<Self, FfiError> {
-        // Prime the calling thread's Lean context and surface schema-load
-        // errors eagerly; worker threads initialize lazily via `with_lean`.
-        with_lean(schema, |_ffi, _ls| Ok(()))?;
+        // Load the schema once and mark it persistent so a single immutable copy
+        // is shared across all worker threads, rather than re-loaded per thread
+        // or cached in thread-local state (where a later analyzer with a different
+        // schema could silently reuse it). Surfaces schema-load errors eagerly.
+        let lean_schema = with_ffi(|ffi| ffi.load_lean_schema_object(schema))?;
+        lean_schema.mark_persistent();
         Ok(Self {
             schema,
+            lean_schema: SharedSchema(lean_schema),
             json_output,
         })
+    }
+
+    /// Runs `f` with the calling thread's `CedarLeanFfi` and this analyzer's shared schema.
+    fn with_lean<R>(
+        &self,
+        f: impl FnOnce(&CedarLeanFfi, &LeanSchema) -> Result<R, FfiError>,
+    ) -> Result<R, FfiError> {
+        with_ffi(|ffi| f(ffi, &self.lean_schema.0))
     }
 
     /// Change the `json_output` setting without reconstructing an entire new `Analyzer`
@@ -85,107 +141,161 @@ impl<'a> Analyzer<'a> {
 
     /// Analyze a Cedar `PolicySet` with respect to the `Analyzer`'s `Schema` and print the findings
     pub fn analyze_policyset(&self, policy_set: PolicySet) -> Result<(), ExecError> {
-        let req_envs = OpenRequestEnv::any().to_request_envs(&self.schema)?;
-        let policies: Vec<&Policy> = policy_set.policies().collect();
-
-        // Per-policy vacuity is independent per policy -> compute in parallel.
-        let policy_vacuity_results: HashMap<PolicyId, Vec<VacuityResult>> = policies
-            .par_iter()
-            .map(|policy| -> Result<(PolicyId, Vec<VacuityResult>), ExecError> {
-                Ok((policy.id().clone(), self.policy_vacuous(policy, &req_envs)?))
-            })
-            .collect::<Result<HashMap<_, _>, ExecError>>()?;
-
-        // p1 |-> [envF_1, envF_2, ..., envF_n] and p2 \in envF_i then p1 and p2 are equivalent for the ith request environment
-        let mut redundant_findings: HashMap<PolicyId, Vec<HashSet<PolicyId>>> = HashMap::new();
-        // p1 |-> [envF_1, envF_2, ..., envF_n] and p2 \in envF_i then p2 shadows p1 for the ith request environment
-        let mut permit_shadowed_by_permit_findings: HashMap<PolicyId, Vec<HashSet<PolicyId>>> =
-            HashMap::new();
-        // p1 |-> [envF_1, envF_2, ..., envF_n] and p2 \in envF_i then p2 overrides p1 for the ith request environment
-        let mut permit_overriden_by_forbid_findings: HashMap<PolicyId, Vec<HashSet<PolicyId>>> =
-            HashMap::new();
-        // p1 |-> [envF_1, envF_2, ..., envF_n] and p2 \in envF_i then p2 shadows p1 for the ith request environment
-        let mut forbid_shadowed_by_forbid_findigns: HashMap<PolicyId, Vec<HashSet<PolicyId>>> =
-            HashMap::new();
-
-        let policyset_vacuity_results = self.policyset_vacuous(&policy_set, &req_envs)?;
-
-        // The expensive pairwise checks are independent per pair: run them in
-        // parallel, then merge sequentially. HashMap/HashSet contents are
-        // order-independent, so the merged result matches the sequential analyzer.
-        let pairs: Vec<[&Policy; 2]> = policies.iter().copied().array_combinations().collect();
-        let pair_findings: Vec<PairFindings> = pairs
-            .into_par_iter()
-            .map(|[policy1, policy2]| -> Result<PairFindings, ExecError> {
-                let svr = policy_vacuity_results
-                    .get(policy1.id())
-                    .expect("Vacuousness of policy1 not precomputed");
-                let tvr = policy_vacuity_results
-                    .get(policy2.id())
-                    .expect("Vacuousness of policy2 not precomputed");
-                Ok(match (policy1.effect(), policy2.effect()) {
-                    (Effect::Permit, Effect::Permit) => PairFindings::PermitPermit(
-                        policy1.id().clone(),
-                        policy2.id().clone(),
-                        self.compute_permit_shadowing_result(policy1, svr, policy2, tvr, &req_envs)?,
-                    ),
-                    (Effect::Permit, Effect::Forbid) => PairFindings::PermitOverride(
-                        policy1.id().clone(),
-                        policy2.id().clone(),
-                        self.compute_forbid_overrides_shadow_result(
-                            policy2, tvr, policy1, svr, &req_envs,
-                        )?,
-                    ),
-                    (Effect::Forbid, Effect::Permit) => PairFindings::PermitOverride(
-                        policy2.id().clone(),
-                        policy1.id().clone(),
-                        self.compute_forbid_overrides_shadow_result(
-                            policy1, svr, policy2, tvr, &req_envs,
-                        )?,
-                    ),
-                    (Effect::Forbid, Effect::Forbid) => PairFindings::ForbidForbid(
-                        policy1.id().clone(),
-                        policy2.id().clone(),
-                        self.compute_forbid_shadowing_result(policy1, svr, policy2, tvr, &req_envs)?,
-                    ),
-                })
-            })
-            .collect::<Result<Vec<_>, ExecError>>()?;
-
-        for pf in &pair_findings {
-            match pf {
-                PairFindings::PermitPermit(p1, p2, results) => {
-                    update_findings(p1, p2, results, &mut redundant_findings, ShadowingResult::Equivalent);
-                    update_findings(p2, p1, results, &mut redundant_findings, ShadowingResult::Equivalent);
-                    update_findings(p1, p2, results, &mut permit_shadowed_by_permit_findings, ShadowingResult::Policy2Shadows1);
-                    update_findings(p2, p1, results, &mut permit_shadowed_by_permit_findings, ShadowingResult::Policy1Shadows2);
-                }
-                PairFindings::PermitOverride(permit, forbid, results) => {
-                    update_findings(permit, forbid, results, &mut permit_overriden_by_forbid_findings, OverrideResult::Overrides);
-                }
-                PairFindings::ForbidForbid(p1, p2, results) => {
-                    update_findings(p1, p2, results, &mut redundant_findings, ShadowingResult::Equivalent);
-                    update_findings(p2, p1, results, &mut redundant_findings, ShadowingResult::Equivalent);
-                    update_findings(p1, p2, results, &mut forbid_shadowed_by_forbid_findigns, ShadowingResult::Policy2Shadows1);
-                    update_findings(p2, p1, results, &mut forbid_shadowed_by_forbid_findigns, ShadowingResult::Policy1Shadows2);
-                }
-            }
-        }
-        let findings = AnalyzePolicyFindings::new(
-            req_envs,
-            policyset_vacuity_results,
-            policy_vacuity_results,
-            redundant_findings,
-            permit_shadowed_by_permit_findings,
-            permit_overriden_by_forbid_findings,
-            forbid_shadowed_by_forbid_findigns,
-        );
+        let findings = self.compute_findings(&policy_set)?;
         if self.json_output {
             findings.print_json(&policy_set);
         } else {
             findings.print_table();
         }
         Ok(())
+    }
+
+    /// Compute the analysis findings for `policy_set` without printing them.
+    fn compute_findings(&self, policy_set: &PolicySet) -> Result<AnalyzePolicyFindings, ExecError> {
+        let req_envs = OpenRequestEnv::any().to_request_envs(self.schema)?;
+        let policies: Vec<&Policy> = policy_set.policies().collect();
+
+        // Per-policy vacuity is independent per policy -> compute in parallel.
+        let policy_vacuity_results: HashMap<PolicyId, Vec<VacuityResult>> = policies
+            .par_iter()
+            .map(
+                |policy| -> Result<(PolicyId, Vec<VacuityResult>), ExecError> {
+                    Ok((policy.id().clone(), self.policy_vacuous(policy, &req_envs)?))
+                },
+            )
+            .collect::<Result<HashMap<_, _>, ExecError>>()?;
+
+        let policyset_vacuity_results = self.policyset_vacuous(policy_set, &req_envs)?;
+
+        // The expensive pairwise checks are independent per pair: run them in
+        // parallel, folding each pair's result directly into a per-worker
+        // accumulator and merging the accumulators, so no intermediate per-pair
+        // results are retained. The per-environment work inside each pair is also
+        // parallelized; benchmarking showed this nested parallelism is ~5-10%
+        // faster than pair-only, as it load-balances the per-pair tail. Findings
+        // are order-independent, so the result matches the sequential analyzer.
+        let pairs: Vec<[&Policy; 2]> = policies.iter().copied().array_combinations().collect();
+        let findings = pairs
+            .par_iter()
+            .try_fold(
+                Findings::default,
+                |mut acc, pair| -> Result<Findings, ExecError> {
+                    let [policy1, policy2] = *pair;
+                    let svr = policy_vacuity_results
+                        .get(policy1.id())
+                        .expect("Vacuousness of policy1 not precomputed");
+                    let tvr = policy_vacuity_results
+                        .get(policy2.id())
+                        .expect("Vacuousness of policy2 not precomputed");
+                    match (policy1.effect(), policy2.effect()) {
+                        (Effect::Permit, Effect::Permit) => {
+                            let results = self.compute_permit_shadowing_result(
+                                policy1, svr, policy2, tvr, &req_envs,
+                            )?;
+                            update_findings(
+                                policy1.id(),
+                                policy2.id(),
+                                &results,
+                                &mut acc.redundant,
+                                ShadowingResult::Equivalent,
+                            );
+                            update_findings(
+                                policy2.id(),
+                                policy1.id(),
+                                &results,
+                                &mut acc.redundant,
+                                ShadowingResult::Equivalent,
+                            );
+                            update_findings(
+                                policy1.id(),
+                                policy2.id(),
+                                &results,
+                                &mut acc.permit_shadowed,
+                                ShadowingResult::Policy2Shadows1,
+                            );
+                            update_findings(
+                                policy2.id(),
+                                policy1.id(),
+                                &results,
+                                &mut acc.permit_shadowed,
+                                ShadowingResult::Policy1Shadows2,
+                            );
+                        }
+                        (Effect::Permit, Effect::Forbid) => {
+                            let results = self.compute_forbid_overrides_shadow_result(
+                                policy2, tvr, policy1, svr, &req_envs,
+                            )?;
+                            update_findings(
+                                policy1.id(),
+                                policy2.id(),
+                                &results,
+                                &mut acc.permit_overridden,
+                                OverrideResult::Overrides,
+                            );
+                        }
+                        (Effect::Forbid, Effect::Permit) => {
+                            let results = self.compute_forbid_overrides_shadow_result(
+                                policy1, svr, policy2, tvr, &req_envs,
+                            )?;
+                            update_findings(
+                                policy2.id(),
+                                policy1.id(),
+                                &results,
+                                &mut acc.permit_overridden,
+                                OverrideResult::Overrides,
+                            );
+                        }
+                        (Effect::Forbid, Effect::Forbid) => {
+                            let results = self.compute_forbid_shadowing_result(
+                                policy1, svr, policy2, tvr, &req_envs,
+                            )?;
+                            update_findings(
+                                policy1.id(),
+                                policy2.id(),
+                                &results,
+                                &mut acc.redundant,
+                                ShadowingResult::Equivalent,
+                            );
+                            update_findings(
+                                policy2.id(),
+                                policy1.id(),
+                                &results,
+                                &mut acc.redundant,
+                                ShadowingResult::Equivalent,
+                            );
+                            update_findings(
+                                policy1.id(),
+                                policy2.id(),
+                                &results,
+                                &mut acc.forbid_shadowed,
+                                ShadowingResult::Policy2Shadows1,
+                            );
+                            update_findings(
+                                policy2.id(),
+                                policy1.id(),
+                                &results,
+                                &mut acc.forbid_shadowed,
+                                ShadowingResult::Policy1Shadows2,
+                            );
+                        }
+                    }
+                    Ok(acc)
+                },
+            )
+            .try_reduce(Findings::default, |mut a, b| {
+                a.merge(b);
+                Ok(a)
+            })?;
+
+        Ok(AnalyzePolicyFindings::new(
+            req_envs,
+            policyset_vacuity_results,
+            policy_vacuity_results,
+            findings.redundant,
+            findings.permit_shadowed,
+            findings.permit_overridden,
+            findings.forbid_shadowed,
+        ))
     }
 }
 
@@ -475,7 +585,7 @@ impl<'a> Analyzer<'a> {
         Ok(req_envs
             .par_iter()
             .map(|req_env| {
-                with_lean(self.schema, |ffi, ls| {
+                self.with_lean(|ffi, ls| {
                     if ffi.run_check_always_allows(policyset, ls.clone(), req_env)? {
                         Ok(VacuityResult::MatchesAll)
                     } else if ffi.run_check_always_denies(policyset, ls.clone(), req_env)? {
@@ -497,7 +607,7 @@ impl<'a> Analyzer<'a> {
         Ok(req_envs
             .par_iter()
             .map(|req_env| {
-                with_lean(self.schema, |ffi, ls| {
+                self.with_lean(|ffi, ls| {
                     if ffi.run_check_always_matches(policy, ls.clone(), req_env)? {
                         Ok(VacuityResult::MatchesAll)
                     } else if ffi.run_check_never_matches(policy, ls.clone(), req_env)? {
@@ -565,7 +675,7 @@ impl<'a> Analyzer<'a> {
                         }
                         (VacuityResult::MatchesSome, VacuityResult::MatchesSome) => {
                             let (policy1shadows2, policy2shadows1) =
-                                with_lean(self.schema, |ffi, ls| {
+                                self.with_lean(|ffi, ls| {
                                     Ok((
                                         ffi.run_check_implies(&pset1, &pset2, ls.clone(), req_env)?,
                                         ffi.run_check_implies(&pset2, &pset1, ls.clone(), req_env)?,
@@ -606,28 +716,30 @@ impl<'a> Analyzer<'a> {
             .into_par_iter()
             .map(|i| -> Result<OverrideResult, ExecError> {
                 let req_env = &req_envs[i];
-                Ok(match (&forbid_vacuous_results[i], &permit_vacuous_results[i]) {
-                    // forbid vacuous: does not apply or denies all; permit
-                    // vacuous: does not apply or allows all (no override check).
-                    (VacuityResult::MatchesNone, _)
-                    | (VacuityResult::MatchesAll, _)
-                    | (_, VacuityResult::MatchesNone)
-                    | (_, VacuityResult::MatchesAll) => OverrideResult::NoResult,
-                    _ => {
-                        if with_lean(self.schema, |ffi, ls| {
-                            ffi.run_check_matches_implies(
-                                permit_policy,
-                                forbid_policy,
-                                ls.clone(),
-                                req_env,
-                            )
-                        })? {
-                            OverrideResult::Overrides // every request allowed by permit is denied by forbid
-                        } else {
-                            OverrideResult::NoResult // some request allowed by permit is not denied by forbid
+                Ok(
+                    match (&forbid_vacuous_results[i], &permit_vacuous_results[i]) {
+                        // forbid vacuous: does not apply or denies all; permit
+                        // vacuous: does not apply or allows all (no override check).
+                        (VacuityResult::MatchesNone, _)
+                        | (VacuityResult::MatchesAll, _)
+                        | (_, VacuityResult::MatchesNone)
+                        | (_, VacuityResult::MatchesAll) => OverrideResult::NoResult,
+                        _ => {
+                            if self.with_lean(|ffi, ls| {
+                                ffi.run_check_matches_implies(
+                                    permit_policy,
+                                    forbid_policy,
+                                    ls.clone(),
+                                    req_env,
+                                )
+                            })? {
+                                OverrideResult::Overrides // every request allowed by permit is denied by forbid
+                            } else {
+                                OverrideResult::NoResult // some request allowed by permit is not denied by forbid
+                            }
                         }
-                    }
-                })
+                    },
+                )
             })
             .collect()
     }
@@ -662,7 +774,7 @@ impl<'a> Analyzer<'a> {
                         }
                         (VacuityResult::MatchesSome, VacuityResult::MatchesSome) => {
                             let (policy1shadows2, policy2shadows1) =
-                                with_lean(self.schema, |ffi, ls| {
+                                self.with_lean(|ffi, ls| {
                                     Ok((
                                         ffi.run_check_matches_implies(
                                             policy1,
@@ -890,7 +1002,7 @@ impl<'a> Analyzer<'a> {
         let comparison_results: Vec<PolicySetComparisonResult> = req_envs
             .par_iter()
             .map(|req_env| -> Result<PolicySetComparisonResult, ExecError> {
-                let (fwd_implies, bwd_implies) = with_lean(self.schema, |ffi, ls| {
+                let (fwd_implies, bwd_implies) = self.with_lean(|ffi, ls| {
                     Ok((
                         ffi.run_check_implies_with_cex(&pset1, &pset2, ls.clone(), req_env)?,
                         ffi.run_check_implies_with_cex(&pset2, &pset1, ls.clone(), req_env)?,
@@ -921,5 +1033,104 @@ impl<'a> Analyzer<'a> {
             print_compare_results(&comparison_results);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    // Two identical permit-all policies: equivalent in every request environment,
+    // so each environment reports one (redundancy) finding.
+    const POLICIES: &str =
+        "permit(principal, action, resource);\npermit(principal, action, resource);\n";
+
+    const SCHEMA_ONE_ACTION: &str = r#"
+        entity User;
+        entity Resource;
+        action read appliesTo { principal: [User], resource: [Resource] };
+    "#;
+
+    const SCHEMA_TWO_ACTIONS: &str = r#"
+        entity User;
+        entity Resource;
+        action read appliesTo { principal: [User], resource: [Resource] };
+        action write appliesTo { principal: [User], resource: [Resource] };
+    "#;
+
+    fn parse_schema(src: &str) -> Schema {
+        Schema::from_str(src).expect("test schema should parse")
+    }
+
+    fn parse_policies() -> PolicySet {
+        PolicySet::from_str(POLICIES).expect("test policies should parse")
+    }
+
+    /// Number of request environments in which a finding is reported. For the
+    /// permit-all pair this equals the schema's request-environment count.
+    fn finding_env_count(findings: &AnalyzePolicyFindings) -> usize {
+        findings.per_sig_findings.len()
+    }
+
+    #[test]
+    fn analysis_is_correct_under_concurrent_load() {
+        // Several analyses at once, each spawning rayon workers that call into
+        // Lean, exercise concurrent use of the Lean runtime from many initialized
+        // threads. Each analysis owns its persistent schema, so results must be
+        // consistent and free of crashes/races.
+        let schema = parse_schema(SCHEMA_TWO_ACTIONS);
+        let policies = parse_policies();
+        let counts: Vec<usize> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let analyzer = Analyzer::new(&schema, false).expect("analyzer");
+                        let findings = analyzer.compute_findings(&policies).expect("analysis");
+                        finding_env_count(&findings)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("worker"))
+                .collect()
+        });
+        // Two actions -> two request environments, each reporting the finding.
+        assert!(
+            counts.iter().all(|&n| n == 2),
+            "inconsistent finding counts across concurrent analyses: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn analyzer_uses_its_own_schema_not_a_thread_cached_one() {
+        // Regression: pin work to a single worker thread so any per-thread schema
+        // cache would outlive an analyzer. Analyze under a one-action schema, then
+        // a two-action schema, on that same thread. Each analyzer must use its own
+        // schema, so the second analysis must see both request environments and
+        // must not fail building the env for the action absent from the first
+        // schema.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("rayon pool");
+        pool.install(|| {
+            let policies = parse_policies();
+
+            let schema_one = parse_schema(SCHEMA_ONE_ACTION);
+            let findings_one = Analyzer::new(&schema_one, false)
+                .expect("analyzer one")
+                .compute_findings(&policies)
+                .expect("analysis one");
+            assert_eq!(finding_env_count(&findings_one), 1);
+
+            let schema_two = parse_schema(SCHEMA_TWO_ACTIONS);
+            let findings_two = Analyzer::new(&schema_two, false)
+                .expect("analyzer two")
+                .compute_findings(&policies)
+                .expect("analysis two must use schema_two, not a cached schema_one");
+            assert_eq!(finding_env_count(&findings_two), 2);
+        });
     }
 }

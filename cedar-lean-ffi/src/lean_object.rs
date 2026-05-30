@@ -27,7 +27,8 @@ use thiserror::Error;
 
 use lean_sys::{
     lean_alloc_sarray, lean_ctor_get, lean_ctor_num_objs, lean_dec, lean_inc, lean_is_ctor,
-    lean_is_string, lean_object, lean_ptr_tag, lean_sarray_object, lean_string_cstr,
+    lean_is_string, lean_mark_persistent, lean_object, lean_ptr_tag, lean_sarray_object,
+    lean_string_cstr,
 };
 
 use crate::FfiError;
@@ -217,6 +218,16 @@ impl OwnedLeanObject {
     /// Obtain a borrowed lean object from this owned object
     pub fn as_borrowed<'a>(&'a self) -> LeanObject<'a> {
         LeanObject(self.0, PhantomData)
+    }
+
+    /// Mark this object and its reachable children as persistent: their Lean
+    /// reference counts become immutable (`lean_inc`/`lean_dec` are no-ops) and
+    /// they are never freed. A persistent object can be read concurrently from
+    /// multiple threads, since reference-count operations no longer race.
+    pub fn mark_persistent(&self) {
+        // The object is reachable and well-formed; marking it persistent only
+        // freezes its reference count and never frees memory early.
+        unsafe { lean_mark_persistent(self.0) }
     }
 }
 

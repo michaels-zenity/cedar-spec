@@ -297,6 +297,16 @@ unsafe extern "C" {
 #[derive(Clone, Debug)]
 pub struct LeanSchema(OwnedLeanObject);
 
+impl LeanSchema {
+    /// Mark this schema's Lean object graph as persistent so it can be shared
+    /// across threads: reference-count operations become no-ops and the graph is
+    /// never freed. Intended for a read-only schema reused for a process's
+    /// lifetime (e.g. shared by parallel analysis workers).
+    pub fn mark_persistent(&self) {
+        self.0.mark_persistent();
+    }
+}
+
 /// Lean can only be initialized once, use a static variable to know if lean backend needs
 /// to be initialized
 static START: Once = Once::new();
@@ -572,7 +582,18 @@ macro_rules! checkAsserts_func {
 }
 
 impl CedarLeanFfi {
-    /// WARNING: we can only have one Lean thread
+    /// Initializes the Lean runtime and the calling OS thread for FFI use.
+    ///
+    /// The global runtime is initialized exactly once (guarded by `START`); the
+    /// per-thread setup (`lean_initialize_thread`) runs on every call. Each OS
+    /// thread that calls into Lean must therefore construct its own
+    /// `CedarLeanFfi` and drop it on that same thread (its `Drop` calls
+    /// `lean_finalize_thread`); a `thread_local` does this naturally. Lean
+    /// objects such as `LeanSchema` are thread-affine (they carry a non-atomic
+    /// reference count) unless marked persistent via
+    /// [`LeanSchema::mark_persistent`], which freezes the reference count and
+    /// makes a read-only object safe to share across threads. Given those rules,
+    /// concurrent calls from multiple initialized threads are supported.
     pub fn new() -> Self {
         START.call_once(|| {
             unsafe {
