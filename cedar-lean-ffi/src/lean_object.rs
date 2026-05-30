@@ -222,8 +222,13 @@ impl OwnedLeanObject {
 
     /// Mark this object and its reachable children as persistent: their Lean
     /// reference counts become immutable (`lean_inc`/`lean_dec` are no-ops) and
-    /// they are never freed. A persistent object can be read concurrently from
-    /// multiple threads, since reference-count operations no longer race.
+    /// they are never freed. A persistent object can then be read concurrently
+    /// from multiple threads, since reference-count operations no longer race.
+    ///
+    /// Precondition: call this before sharing the object across threads, and
+    /// while no other access to the same object graph is in progress. Marking
+    /// itself mutates the object headers, so it must not run concurrently with
+    /// other reads or writes of the graph; once marked, concurrent reads are safe.
     pub fn mark_persistent(&self) {
         // The object is reachable and well-formed; marking it persistent only
         // freezes its reference count and never frees memory early.

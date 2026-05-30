@@ -46,18 +46,29 @@ fn with_ffi<R>(f: impl FnOnce(&CedarLeanFfi) -> Result<R, FfiError>) -> Result<R
 }
 
 /// A `LeanSchema` shared by reference across rayon worker threads. The wrapped
-/// schema is marked persistent in `Analyzer::new`, so its Lean reference count is
-/// frozen and the graph is never freed; that is what makes cross-thread sharing
-/// sound, since the FFI's by-value `LeanSchema` arguments would otherwise mutate
-/// a non-atomic refcount on every call.
+/// schema is marked persistent (see [`SharedSchema::new`]), so its Lean reference
+/// count is frozen and the graph is never freed; that is what makes cross-thread
+/// sharing sound, since the FFI's by-value `LeanSchema` arguments would otherwise
+/// mutate a non-atomic refcount on every call.
 struct SharedSchema(LeanSchema);
 
-// SAFETY: the contained schema is marked persistent before the `SharedSchema` is
-// constructed, hence before any other thread can observe it. Persistent Lean
-// objects are never mutated by reference-count operations and never freed, so
-// shared references and the owned clones taken per FFI call are race-free.
+// SAFETY: `SharedSchema::new` is the only constructor and marks the schema
+// persistent before wrapping it, so a `SharedSchema` always holds a persistent
+// object. Persistent Lean objects are never mutated by reference-count operations
+// and never freed, so shared references and the owned clones taken per FFI call
+// are race-free across threads.
 unsafe impl Send for SharedSchema {}
 unsafe impl Sync for SharedSchema {}
+
+impl SharedSchema {
+    /// Marks `schema` persistent and wraps it. As the sole constructor, this
+    /// guarantees the persistence precondition the `unsafe Send`/`Sync` impls
+    /// rely on.
+    fn new(schema: LeanSchema) -> Self {
+        schema.mark_persistent();
+        Self(schema)
+    }
+}
 
 /// Per-request-environment findings accumulated across policy pairs. Each map is
 /// `policy |-> [env_0, .., env_{E-1}]`; `p2` in entry `env_i` of `p1` records a
@@ -90,7 +101,11 @@ fn merge_findings(
     for (pid, envs) in from {
         match into.get_mut(&pid) {
             Some(existing) => {
-                debug_assert_eq!(existing.len(), envs.len());
+                assert_eq!(
+                    existing.len(),
+                    envs.len(),
+                    "finding vectors are sized per request environment"
+                );
                 for (slot, set) in existing.iter_mut().zip(envs) {
                     slot.extend(set);
                 }
@@ -118,10 +133,9 @@ impl<'a> Analyzer<'a> {
         // or cached in thread-local state (where a later analyzer with a different
         // schema could silently reuse it). Surfaces schema-load errors eagerly.
         let lean_schema = with_ffi(|ffi| ffi.load_lean_schema_object(schema))?;
-        lean_schema.mark_persistent();
         Ok(Self {
             schema,
-            lean_schema: SharedSchema(lean_schema),
+            lean_schema: SharedSchema::new(lean_schema),
             json_output,
         })
     }
@@ -167,13 +181,16 @@ impl<'a> Analyzer<'a> {
 
         let policyset_vacuity_results = self.policyset_vacuous(policy_set, &req_envs)?;
 
-        // The expensive pairwise checks are independent per pair: run them in
-        // parallel, folding each pair's result directly into a per-worker
-        // accumulator and merging the accumulators, so no intermediate per-pair
-        // results are retained. The per-environment work inside each pair is also
-        // parallelized; benchmarking showed this nested parallelism is ~5-10%
-        // faster than pair-only, as it load-balances the per-pair tail. Findings
-        // are order-independent, so the result matches the sequential analyzer.
+        // The expensive pairwise checks are independent per pair: collect the
+        // pairs and process them in parallel, folding each pair's result directly
+        // into a per-worker accumulator and merging the accumulators, so no
+        // intermediate per-pair results are retained. Collecting the pair list is
+        // O(P^2) pointers (~tens of KB even for hundreds of policies); we keep it
+        // because a streaming triangular split (parallelizing the outer index with
+        // a sequential inner loop) measured ~2-5% slower here -- flat per-pair
+        // tasks load-balance better across cores. The per-environment work inside
+        // each pair is also parallelized. Findings are order-independent, so the
+        // result matches the sequential analyzer.
         let pairs: Vec<[&Policy; 2]> = policies.iter().copied().array_combinations().collect();
         let findings = pairs
             .par_iter()
