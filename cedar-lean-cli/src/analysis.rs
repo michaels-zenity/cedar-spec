@@ -16,7 +16,7 @@
 use crate::reused_solver;
 use crate::util::{AnalyzePolicyFindingsSer, OpenRequestEnv};
 use crate::{err::ExecError, util::RequestEnvSer};
-use cedar_lean_ffi::{CedarLeanFfi, FfiError, LeanSchema};
+use cedar_lean_ffi::{CedarLeanFfi, FfiError, LeanSchema, Term, TermPrim};
 use cedar_policy::{Effect, Policy, PolicyId, PolicySet, RequestEnv, RestrictedExpression, Schema};
 use itertools::Itertools;
 use nonempty::NonEmpty;
@@ -150,25 +150,39 @@ impl<'a> Analyzer<'a> {
         with_ffi(|ffi| f(ffi, &self.lean_schema.0))
     }
 
-    /// Decide a `checkUnsat`-style verification by reusing this worker thread's
-    /// cvc5 process instead of spawning a fresh solver per query.
+    /// Decide a `checkUnsat`-style verification without spawning a cvc5 process
+    /// per query.
     ///
     /// `script` builds the query's self-contained SMT-LIB via a
     /// `smtlib_of_check_*` FFI call (the encoder runs, but no solver is spawned);
-    /// the reused process then decides it, with the property holding iff the
-    /// script is UNSAT. `solve` is the authoritative `run_check_*` FFI, invoked
-    /// only as a fallback for queries the encoder decided trivially and emitted
-    /// an empty script for. `script` and `solve` must describe the *same* check
-    /// (same primitive, same argument order) so they always agree.
+    /// this worker thread's reused cvc5 process then decides it, with the property
+    /// holding iff the script is UNSAT.
+    ///
+    /// When the encoder decides the query syntactically it emits an *empty*
+    /// script. We then read the verification conditions with `asserts` (a
+    /// `asserts_of_check_*` FFI call, also solver-free) and decide it directly:
+    /// the property holds iff some assertion is the literal `false`. This mirrors
+    /// the Lean backend's `checkUnsatAsserts` (any `false` assertion ⇒ UNSAT ⇒
+    /// `true`; otherwise every assertion is `true` ⇒ SAT ⇒ `false`), so trivially
+    /// decided queries cost no solver process at all. `script` and `asserts` must
+    /// describe the *same* check (same primitive, same argument order).
     fn check_reusing_solver(
         &self,
         script: impl FnOnce(&CedarLeanFfi, &LeanSchema) -> Result<String, FfiError>,
-        solve: impl FnOnce(&CedarLeanFfi, &LeanSchema) -> Result<bool, FfiError>,
+        asserts: impl FnOnce(
+            &CedarLeanFfi,
+            &LeanSchema,
+        ) -> Result<Result<Vec<Term>, String>, FfiError>,
     ) -> Result<bool, ExecError> {
         let smtlib = self.with_lean(script)?;
         match reused_solver::check_unsat(&smtlib)? {
             Some(result) => Ok(result),
-            None => Ok(self.with_lean(solve)?),
+            None => {
+                let asserts = self.with_lean(asserts)?.map_err(FfiError::LeanBackendError)?;
+                Ok(asserts
+                    .iter()
+                    .any(|term| matches!(term, Term::Prim(TermPrim::Bool(false)))))
+            }
         }
     }
 
@@ -628,12 +642,12 @@ impl<'a> Analyzer<'a> {
             .map(|req_env| -> Result<VacuityResult, ExecError> {
                 if self.check_reusing_solver(
                     |ffi, ls| ffi.smtlib_of_check_always_allows(policyset, ls.clone(), req_env),
-                    |ffi, ls| ffi.run_check_always_allows(policyset, ls.clone(), req_env),
+                    |ffi, ls| ffi.asserts_of_check_always_allows(policyset, ls.clone(), req_env),
                 )? {
                     Ok(VacuityResult::MatchesAll)
                 } else if self.check_reusing_solver(
                     |ffi, ls| ffi.smtlib_of_check_always_denies(policyset, ls.clone(), req_env),
-                    |ffi, ls| ffi.run_check_always_denies(policyset, ls.clone(), req_env),
+                    |ffi, ls| ffi.asserts_of_check_always_denies(policyset, ls.clone(), req_env),
                 )? {
                     Ok(VacuityResult::MatchesNone)
                 } else {
@@ -654,12 +668,12 @@ impl<'a> Analyzer<'a> {
             .map(|req_env| -> Result<VacuityResult, ExecError> {
                 if self.check_reusing_solver(
                     |ffi, ls| ffi.smtlib_of_check_always_matches(policy, ls.clone(), req_env),
-                    |ffi, ls| ffi.run_check_always_matches(policy, ls.clone(), req_env),
+                    |ffi, ls| ffi.asserts_of_check_always_matches(policy, ls.clone(), req_env),
                 )? {
                     Ok(VacuityResult::MatchesAll)
                 } else if self.check_reusing_solver(
                     |ffi, ls| ffi.smtlib_of_check_never_matches(policy, ls.clone(), req_env),
-                    |ffi, ls| ffi.run_check_never_matches(policy, ls.clone(), req_env),
+                    |ffi, ls| ffi.asserts_of_check_never_matches(policy, ls.clone(), req_env),
                 )? {
                     Ok(VacuityResult::MatchesNone)
                 } else {
@@ -728,7 +742,7 @@ impl<'a> Analyzer<'a> {
                                     ffi.smtlib_of_check_implies(&pset1, &pset2, ls.clone(), req_env)
                                 },
                                 |ffi, ls| {
-                                    ffi.run_check_implies(&pset1, &pset2, ls.clone(), req_env)
+                                    ffi.asserts_of_check_implies(&pset1, &pset2, ls.clone(), req_env)
                                 },
                             )?;
                             let policy2shadows1 = self.check_reusing_solver(
@@ -736,7 +750,7 @@ impl<'a> Analyzer<'a> {
                                     ffi.smtlib_of_check_implies(&pset2, &pset1, ls.clone(), req_env)
                                 },
                                 |ffi, ls| {
-                                    ffi.run_check_implies(&pset2, &pset1, ls.clone(), req_env)
+                                    ffi.asserts_of_check_implies(&pset2, &pset1, ls.clone(), req_env)
                                 },
                             )?;
                             match (policy1shadows2, policy2shadows1) {
@@ -793,7 +807,7 @@ impl<'a> Analyzer<'a> {
                                     )
                                 },
                                 |ffi, ls| {
-                                    ffi.run_check_matches_implies(
+                                    ffi.asserts_of_check_matches_implies(
                                         permit_policy,
                                         forbid_policy,
                                         ls.clone(),
@@ -851,7 +865,7 @@ impl<'a> Analyzer<'a> {
                                     )
                                 },
                                 |ffi, ls| {
-                                    ffi.run_check_matches_implies(
+                                    ffi.asserts_of_check_matches_implies(
                                         policy1,
                                         policy2,
                                         ls.clone(),
@@ -869,7 +883,7 @@ impl<'a> Analyzer<'a> {
                                     )
                                 },
                                 |ffi, ls| {
-                                    ffi.run_check_matches_implies(
+                                    ffi.asserts_of_check_matches_implies(
                                         policy2,
                                         policy1,
                                         ls.clone(),

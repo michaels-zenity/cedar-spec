@@ -158,10 +158,8 @@ thread_local! {
 /// * `Ok(Some(true))`  -- the script is UNSAT, i.e. the checked property holds;
 /// * `Ok(Some(false))` -- the script is SAT, i.e. the property does not hold;
 /// * `Ok(None)`        -- the query was *trivially decided* by the encoder, which
-///   emits an empty script in that case. The caller must fall back to the
-///   authoritative `run_check_*` FFI, which returns the right answer without
-///   needing a solver decision. (This path is rare and still spawns one cvc5, so
-///   it is no worse than the baseline for those queries.)
+///   emits an empty script in that case. No solver is run; the caller decides it
+///   directly from the assertions (see `Analyzer::check_reusing_solver`).
 ///
 /// On any solver failure the thread-local process is discarded, so a desynced or
 /// closed pipe can never poison subsequent queries on this thread -- the next
