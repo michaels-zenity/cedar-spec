@@ -19,6 +19,7 @@ mod cli_enums;
 mod cli_exec;
 mod err;
 mod evaluation;
+mod reused_solver;
 mod symcc;
 mod util;
 mod validation;

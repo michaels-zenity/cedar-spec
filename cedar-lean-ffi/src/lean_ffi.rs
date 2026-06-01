@@ -1030,6 +1030,30 @@ impl CedarLeanFfi {
         String
     );
 
+    checkPolicy_func!(
+        smtlib_of_check_always_matches_timed,
+        smtlib_of_check_always_matches,
+        smtLibOfCheckAlwaysMatches,
+        |x| x,
+        String
+    );
+
+    checkPolicy_func!(
+        smtlib_of_check_never_matches_timed,
+        smtlib_of_check_never_matches,
+        smtLibOfCheckNeverMatches,
+        |x| x,
+        String
+    );
+
+    comparePolicies_func!(
+        smtlib_of_check_matches_implies_timed,
+        smtlib_of_check_matches_implies,
+        smtLibOfCheckMatchesImplies,
+        |x| x,
+        String
+    );
+
     /// Calls the lean backend to determine if the `Request` is allowed
     /// by the `PolicySet` given the provided set of `Entities`
     pub fn is_authorized_timed(

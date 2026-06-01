@@ -103,4 +103,6 @@ pub enum ExecError {
     },
     #[error(transparent)]
     LeanFFIError(#[from] cedar_lean_ffi::FfiError),
+    #[error("Error from reused cvc5 solver : {0}")]
+    ReusedSolverError(#[from] crate::reused_solver::SolverError),
 }

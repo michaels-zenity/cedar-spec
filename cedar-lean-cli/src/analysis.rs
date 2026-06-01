@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+use crate::reused_solver;
 use crate::util::{AnalyzePolicyFindingsSer, OpenRequestEnv};
 use crate::{err::ExecError, util::RequestEnvSer};
 use cedar_lean_ffi::{CedarLeanFfi, FfiError, LeanSchema};
@@ -147,6 +148,28 @@ impl<'a> Analyzer<'a> {
         f: impl FnOnce(&CedarLeanFfi, &LeanSchema) -> Result<R, FfiError>,
     ) -> Result<R, FfiError> {
         with_ffi(|ffi| f(ffi, &self.lean_schema.0))
+    }
+
+    /// Decide a `checkUnsat`-style verification by reusing this worker thread's
+    /// cvc5 process instead of spawning a fresh solver per query.
+    ///
+    /// `script` builds the query's self-contained SMT-LIB via a
+    /// `smtlib_of_check_*` FFI call (the encoder runs, but no solver is spawned);
+    /// the reused process then decides it, with the property holding iff the
+    /// script is UNSAT. `solve` is the authoritative `run_check_*` FFI, invoked
+    /// only as a fallback for queries the encoder decided trivially and emitted
+    /// an empty script for. `script` and `solve` must describe the *same* check
+    /// (same primitive, same argument order) so they always agree.
+    fn check_reusing_solver(
+        &self,
+        script: impl FnOnce(&CedarLeanFfi, &LeanSchema) -> Result<String, FfiError>,
+        solve: impl FnOnce(&CedarLeanFfi, &LeanSchema) -> Result<bool, FfiError>,
+    ) -> Result<bool, ExecError> {
+        let smtlib = self.with_lean(script)?;
+        match reused_solver::check_unsat(&smtlib)? {
+            Some(result) => Ok(result),
+            None => Ok(self.with_lean(solve)?),
+        }
     }
 
     /// Change the `json_output` setting without reconstructing an entire new `Analyzer`
@@ -600,20 +623,24 @@ impl<'a> Analyzer<'a> {
         policyset: &PolicySet,
         req_envs: &Vec<RequestEnv>,
     ) -> Result<Vec<VacuityResult>, ExecError> {
-        Ok(req_envs
+        req_envs
             .par_iter()
-            .map(|req_env| {
-                self.with_lean(|ffi, ls| {
-                    if ffi.run_check_always_allows(policyset, ls.clone(), req_env)? {
-                        Ok(VacuityResult::MatchesAll)
-                    } else if ffi.run_check_always_denies(policyset, ls.clone(), req_env)? {
-                        Ok(VacuityResult::MatchesNone)
-                    } else {
-                        Ok(VacuityResult::MatchesSome)
-                    }
-                })
+            .map(|req_env| -> Result<VacuityResult, ExecError> {
+                if self.check_reusing_solver(
+                    |ffi, ls| ffi.smtlib_of_check_always_allows(policyset, ls.clone(), req_env),
+                    |ffi, ls| ffi.run_check_always_allows(policyset, ls.clone(), req_env),
+                )? {
+                    Ok(VacuityResult::MatchesAll)
+                } else if self.check_reusing_solver(
+                    |ffi, ls| ffi.smtlib_of_check_always_denies(policyset, ls.clone(), req_env),
+                    |ffi, ls| ffi.run_check_always_denies(policyset, ls.clone(), req_env),
+                )? {
+                    Ok(VacuityResult::MatchesNone)
+                } else {
+                    Ok(VacuityResult::MatchesSome)
+                }
             })
-            .collect::<Result<Vec<_>, FfiError>>()?)
+            .collect()
     }
 
     /// Is a given Policy vacuous (per request environment)
@@ -622,20 +649,24 @@ impl<'a> Analyzer<'a> {
         policy: &Policy,
         req_envs: &Vec<RequestEnv>,
     ) -> Result<Vec<VacuityResult>, ExecError> {
-        Ok(req_envs
+        req_envs
             .par_iter()
-            .map(|req_env| {
-                self.with_lean(|ffi, ls| {
-                    if ffi.run_check_always_matches(policy, ls.clone(), req_env)? {
-                        Ok(VacuityResult::MatchesAll)
-                    } else if ffi.run_check_never_matches(policy, ls.clone(), req_env)? {
-                        Ok(VacuityResult::MatchesNone)
-                    } else {
-                        Ok(VacuityResult::MatchesSome)
-                    }
-                })
+            .map(|req_env| -> Result<VacuityResult, ExecError> {
+                if self.check_reusing_solver(
+                    |ffi, ls| ffi.smtlib_of_check_always_matches(policy, ls.clone(), req_env),
+                    |ffi, ls| ffi.run_check_always_matches(policy, ls.clone(), req_env),
+                )? {
+                    Ok(VacuityResult::MatchesAll)
+                } else if self.check_reusing_solver(
+                    |ffi, ls| ffi.smtlib_of_check_never_matches(policy, ls.clone(), req_env),
+                    |ffi, ls| ffi.run_check_never_matches(policy, ls.clone(), req_env),
+                )? {
+                    Ok(VacuityResult::MatchesNone)
+                } else {
+                    Ok(VacuityResult::MatchesSome)
+                }
             })
-            .collect::<Result<Vec<_>, FfiError>>()?)
+            .collect()
     }
 }
 
@@ -692,13 +723,22 @@ impl<'a> Analyzer<'a> {
                             ShadowingResult::Policy2Shadows1
                         }
                         (VacuityResult::MatchesSome, VacuityResult::MatchesSome) => {
-                            let (policy1shadows2, policy2shadows1) =
-                                self.with_lean(|ffi, ls| {
-                                    Ok((
-                                        ffi.run_check_implies(&pset1, &pset2, ls.clone(), req_env)?,
-                                        ffi.run_check_implies(&pset2, &pset1, ls.clone(), req_env)?,
-                                    ))
-                                })?;
+                            let policy1shadows2 = self.check_reusing_solver(
+                                |ffi, ls| {
+                                    ffi.smtlib_of_check_implies(&pset1, &pset2, ls.clone(), req_env)
+                                },
+                                |ffi, ls| {
+                                    ffi.run_check_implies(&pset1, &pset2, ls.clone(), req_env)
+                                },
+                            )?;
+                            let policy2shadows1 = self.check_reusing_solver(
+                                |ffi, ls| {
+                                    ffi.smtlib_of_check_implies(&pset2, &pset1, ls.clone(), req_env)
+                                },
+                                |ffi, ls| {
+                                    ffi.run_check_implies(&pset2, &pset1, ls.clone(), req_env)
+                                },
+                            )?;
                             match (policy1shadows2, policy2shadows1) {
                                 (true, true) => ShadowingResult::Equivalent,
                                 (true, false) => ShadowingResult::Policy2Shadows1,
@@ -743,14 +783,24 @@ impl<'a> Analyzer<'a> {
                         | (_, VacuityResult::MatchesNone)
                         | (_, VacuityResult::MatchesAll) => OverrideResult::NoResult,
                         _ => {
-                            if self.with_lean(|ffi, ls| {
-                                ffi.run_check_matches_implies(
-                                    permit_policy,
-                                    forbid_policy,
-                                    ls.clone(),
-                                    req_env,
-                                )
-                            })? {
+                            if self.check_reusing_solver(
+                                |ffi, ls| {
+                                    ffi.smtlib_of_check_matches_implies(
+                                        permit_policy,
+                                        forbid_policy,
+                                        ls.clone(),
+                                        req_env,
+                                    )
+                                },
+                                |ffi, ls| {
+                                    ffi.run_check_matches_implies(
+                                        permit_policy,
+                                        forbid_policy,
+                                        ls.clone(),
+                                        req_env,
+                                    )
+                                },
+                            )? {
                                 OverrideResult::Overrides // every request allowed by permit is denied by forbid
                             } else {
                                 OverrideResult::NoResult // some request allowed by permit is not denied by forbid
@@ -791,23 +841,42 @@ impl<'a> Analyzer<'a> {
                             ShadowingResult::Policy2Shadows1
                         }
                         (VacuityResult::MatchesSome, VacuityResult::MatchesSome) => {
-                            let (policy1shadows2, policy2shadows1) =
-                                self.with_lean(|ffi, ls| {
-                                    Ok((
-                                        ffi.run_check_matches_implies(
-                                            policy1,
-                                            policy2,
-                                            ls.clone(),
-                                            req_env,
-                                        )?,
-                                        ffi.run_check_matches_implies(
-                                            policy2,
-                                            policy1,
-                                            ls.clone(),
-                                            req_env,
-                                        )?,
-                                    ))
-                                })?;
+                            let policy1shadows2 = self.check_reusing_solver(
+                                |ffi, ls| {
+                                    ffi.smtlib_of_check_matches_implies(
+                                        policy1,
+                                        policy2,
+                                        ls.clone(),
+                                        req_env,
+                                    )
+                                },
+                                |ffi, ls| {
+                                    ffi.run_check_matches_implies(
+                                        policy1,
+                                        policy2,
+                                        ls.clone(),
+                                        req_env,
+                                    )
+                                },
+                            )?;
+                            let policy2shadows1 = self.check_reusing_solver(
+                                |ffi, ls| {
+                                    ffi.smtlib_of_check_matches_implies(
+                                        policy2,
+                                        policy1,
+                                        ls.clone(),
+                                        req_env,
+                                    )
+                                },
+                                |ffi, ls| {
+                                    ffi.run_check_matches_implies(
+                                        policy2,
+                                        policy1,
+                                        ls.clone(),
+                                        req_env,
+                                    )
+                                },
+                            )?;
                             match (policy1shadows2, policy2shadows1) {
                                 (true, true) => ShadowingResult::Equivalent,
                                 (true, false) => ShadowingResult::Policy2Shadows1,
