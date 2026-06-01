@@ -88,11 +88,17 @@ pub enum ExecError {
         error: Box<dyn std::error::Error + Send + Sync>,
     },
     #[error("Error converting Policy to a PolicySet : {error}")]
-    PolicyIntoPolicySetError { error: Box<dyn std::error::Error + Send + Sync> },
+    PolicyIntoPolicySetError {
+        error: Box<dyn std::error::Error + Send + Sync>,
+    },
     #[error("Error during analysis : {error}")]
-    InternalAnalysisError { error: Box<dyn std::error::Error + Send + Sync> },
+    InternalAnalysisError {
+        error: Box<dyn std::error::Error + Send + Sync>,
+    },
     #[error("Error Creating Request : {error}")]
-    RequestValidationError { error: Box<dyn std::error::Error + Send + Sync> },
+    RequestValidationError {
+        error: Box<dyn std::error::Error + Send + Sync>,
+    },
     #[error("Could not fetch actions from Schema")]
     ActionsFromSchemaError(#[from] Box<EntitiesError>),
     #[error("{principal_type} cannot {action_name} on {resource_type} in the provided Schema")]
