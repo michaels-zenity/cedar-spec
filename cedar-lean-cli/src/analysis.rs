@@ -67,7 +67,10 @@ impl SharedSchema {
     /// guarantees the persistence precondition the `unsafe Send`/`Sync` impls
     /// rely on.
     fn new(schema: LeanSchema) -> Self {
-        schema.mark_persistent();
+        // SAFETY: `schema` was just loaded by the caller (`Analyzer::new`) and
+        // has not yet been shared with any other thread, so no concurrent access
+        // to its object graph is possible while we mark it persistent here.
+        unsafe { schema.mark_persistent() };
         Self(schema)
     }
 }
@@ -1160,8 +1163,32 @@ mod tests {
         action write appliesTo { principal: [User], resource: [Resource] };
     "#;
 
+    const SCHEMA_BOOL_ATTR: &str = r#"
+        entity User;
+        entity Resource { private: Bool };
+        action read appliesTo { principal: [User], resource: [Resource] };
+    "#;
+
+    // Two identical *conditional* permits. Their match set depends on
+    // `resource.private`, so neither is syntactically vacuous: deciding vacuity
+    // and their equivalence forces real (non-empty) SMT queries through the
+    // reused cvc5 process, unlike the permit-all fixtures above which the encoder
+    // decides trivially without a solver.
+    const CONDITIONAL_POLICIES: &str = "permit(principal, action, resource) when { resource.private };\npermit(principal, action, resource) when { resource.private };\n";
+
     fn parse_schema(src: &str) -> Schema {
         Schema::from_str(src).expect("test schema should parse")
+    }
+
+    /// Real-solver tests need the `CVC5` env var (as the integration tests do);
+    /// skip rather than fail when it is absent so solver-free runs still pass.
+    fn cvc5_available() -> bool {
+        if std::env::var("CVC5").is_ok() {
+            true
+        } else {
+            eprintln!("skipping analyzer solver test: CVC5 environment variable not set");
+            false
+        }
     }
 
     fn parse_policies() -> PolicySet {
@@ -1233,5 +1260,43 @@ mod tests {
                 .expect("analysis two must use schema_two, not a cached schema_one");
             assert_eq!(finding_env_count(&findings_two), 2);
         });
+    }
+
+    #[test]
+    fn conditional_policies_drive_the_reused_solver() {
+        // Unlike the permit-all fixtures, these policies are non-vacuous, so the
+        // analyzer must route real SMT-LIB queries through the reused cvc5
+        // process (`check_reusing_solver`) rather than short-circuiting on the
+        // syntactic `MatchesAll`/`MatchesNone` paths.
+        if !cvc5_available() {
+            return;
+        }
+        let schema = parse_schema(SCHEMA_BOOL_ATTR);
+        let policies = PolicySet::from_str(CONDITIONAL_POLICIES).expect("policies should parse");
+        let findings = Analyzer::new(&schema, false)
+            .expect("analyzer")
+            .compute_findings(&policies)
+            .expect("analysis");
+
+        // The set only allows when `resource.private`, so it is non-vacuous and
+        // neither policy is flagged vacuous -- both required real solver queries.
+        assert_eq!(findings.vacuous_result, VacuityResult::MatchesSome);
+        assert!(
+            findings.vacuous_policies.is_empty(),
+            "neither conditional permit is vacuous: {:?}",
+            findings.vacuous_policies
+        );
+
+        // One action => one request environment, in which the two identical
+        // conditional permits are found equivalent: a redundancy equiv-class of
+        // size 2, decided by real `check_implies` solver queries.
+        assert_eq!(finding_env_count(&findings), 1);
+        let sig = &findings.per_sig_findings[0];
+        assert_eq!(
+            sig.equiv_classes.len(),
+            1,
+            "the two identical conditional permits form one redundancy class"
+        );
+        assert_eq!(sig.equiv_classes[0].len(), 2);
     }
 }

@@ -302,8 +302,18 @@ impl LeanSchema {
     /// across threads: reference-count operations become no-ops and the graph is
     /// never freed. Intended for a read-only schema reused for a process's
     /// lifetime (e.g. shared by parallel analysis workers).
-    pub fn mark_persistent(&self) {
-        self.0.mark_persistent();
+    ///
+    /// # Safety
+    ///
+    /// Marking mutates the schema's Lean object headers, so the caller must
+    /// ensure that no other access to this schema's object graph -- including
+    /// via [`Clone`]s of this `LeanSchema` -- can occur concurrently with this
+    /// call. Mark the schema before sharing it across threads; once marked,
+    /// concurrent reads are safe.
+    pub unsafe fn mark_persistent(&self) {
+        // SAFETY: the caller upholds the no-concurrent-access precondition for
+        // the whole schema graph, which is exactly what the inner call requires.
+        unsafe { self.0.mark_persistent() };
     }
 }
 

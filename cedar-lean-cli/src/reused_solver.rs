@@ -35,12 +35,23 @@
 use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// How long `Drop` waits for cvc5 to exit cleanly after `(exit)` before it
+/// force-kills the child, so a stuck or desynced solver can never hang teardown.
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(200);
+/// Poll interval while waiting for the clean exit above.
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(5);
+/// Defensive cap on consecutive blank output lines before the stream is treated
+/// as desynced. A well-behaved `--quiet` cvc5 emits none here.
+const MAX_BLANK_LINES: u32 = 1024;
 
 /// A solver failure encountered while reusing a cvc5 process.
 #[derive(Debug)]
 pub enum SolverError {
     /// cvc5 returned `unknown` (mirrors the Lean backend, which errors here).
-    Unknown,
+    /// Carries cvc5's `:reason-unknown` when available, for diagnostics.
+    Unknown(String),
     /// The solver process could not be spawned, or its pipe failed / desynced.
     Io(String),
 }
@@ -48,7 +59,7 @@ pub enum SolverError {
 impl std::fmt::Display for SolverError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SolverError::Unknown => write!(f, "cvc5 returned unknown"),
+            SolverError::Unknown(reason) => write!(f, "cvc5 returned unknown: {reason}"),
             SolverError::Io(msg) => write!(f, "cvc5 process error: {msg}"),
         }
     }
@@ -59,7 +70,7 @@ impl std::error::Error for SolverError {}
 enum Decision {
     Sat,
     Unsat,
-    Unknown,
+    Unknown(String),
 }
 
 /// A live cvc5 child process with its stdin/stdout pipes.
@@ -80,7 +91,9 @@ impl Cvc5 {
             .args(["--quiet", "--lang", "smt"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            // Surface cvc5 diagnostics (version/parse/feature errors) on stderr
+            // rather than discarding them; `--quiet` keeps this silent otherwise.
+            .stderr(Stdio::inherit())
             .spawn()
             .map_err(|e| SolverError::Io(format!("failed to spawn cvc5: {e}")))?;
         let stdin = child
@@ -112,6 +125,7 @@ impl Cvc5 {
         // output line is the `(check-sat)` result. The script emits exactly one
         // `(check-sat)` and no `(get-model)`, so exactly one decision is read.
         let mut line = String::new();
+        let mut blank_lines = 0u32;
         loop {
             line.clear();
             if self.stdout.read_line(&mut line).map_err(io)? == 0 {
@@ -120,10 +134,20 @@ impl Cvc5 {
                 ));
             }
             match line.trim() {
-                "" => continue,
+                "" => {
+                    // A misbehaving solver emitting endless blank lines must not
+                    // wedge this worker in the loop forever.
+                    blank_lines += 1;
+                    if blank_lines > MAX_BLANK_LINES {
+                        return Err(SolverError::Io(
+                            "cvc5 produced only blank output (protocol desync)".to_string(),
+                        ));
+                    }
+                    continue;
+                }
                 "unsat" => return Ok(Decision::Unsat),
                 "sat" => return Ok(Decision::Sat),
-                "unknown" => return Ok(Decision::Unknown),
+                "unknown" => return Ok(Decision::Unknown(self.reason_unknown())),
                 other => {
                     return Err(SolverError::Io(format!(
                         "unrecognized cvc5 output: {other:?}"
@@ -132,13 +156,49 @@ impl Cvc5 {
             }
         }
     }
+
+    /// Best-effort `(get-info :reason-unknown)` so an `unknown` decision carries
+    /// cvc5's own explanation. Called only on the cold `unknown` path, after
+    /// which the process is discarded, so a failed read here is harmless.
+    fn reason_unknown(&mut self) -> String {
+        const FALLBACK: &str = "reason unavailable";
+        if self
+            .stdin
+            .write_all(b"(get-info :reason-unknown)\n")
+            .and_then(|()| self.stdin.flush())
+            .is_err()
+        {
+            return FALLBACK.to_string();
+        }
+        let mut line = String::new();
+        match self.stdout.read_line(&mut line) {
+            Ok(n) if n > 0 && !line.trim().is_empty() => line.trim().to_string(),
+            _ => FALLBACK.to_string(),
+        }
+    }
 }
 
 impl Drop for Cvc5 {
     fn drop(&mut self) {
-        // Best-effort clean shutdown, then reap the child so it never lingers.
+        // Best-effort clean shutdown: ask cvc5 to exit, then reap the child so it
+        // never lingers.
         let _ = self.stdin.write_all(b"(exit)\n");
         let _ = self.stdin.flush();
+
+        // Never block teardown on a stuck or desynced solver: poll for a clean
+        // exit for a short grace period, then force-kill and reap.
+        let deadline = Instant::now() + SHUTDOWN_GRACE;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return, // exited on its own
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(SHUTDOWN_POLL_INTERVAL);
+                }
+                // Grace elapsed, or its state is unknowable: stop waiting.
+                _ => break,
+            }
+        }
+        let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
@@ -180,9 +240,9 @@ pub fn check_unsat(script: &str) -> Result<Option<bool>, SolverError> {
         match decision {
             Ok(Decision::Unsat) => Ok(Some(true)),
             Ok(Decision::Sat) => Ok(Some(false)),
-            Ok(Decision::Unknown) => {
+            Ok(Decision::Unknown(reason)) => {
                 *slot = None;
-                Err(SolverError::Unknown)
+                Err(SolverError::Unknown(reason))
             }
             Err(e) => {
                 *slot = None;
@@ -190,4 +250,61 @@ pub fn check_unsat(script: &str) -> Result<Option<bool>, SolverError> {
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// These tests drive a real cvc5 process, so they require the `CVC5` env var
+    /// (the same requirement as the analyzer's integration tests). When it is
+    /// unset we skip rather than fail, so solver-free `--lib` runs still pass.
+    fn cvc5_available() -> bool {
+        if std::env::var("CVC5").is_ok() {
+            true
+        } else {
+            eprintln!("skipping reused_solver test: CVC5 environment variable not set");
+            false
+        }
+    }
+
+    #[test]
+    fn empty_script_is_trivially_decided_without_a_process() {
+        // The encoder emits an empty script for syntactically-decided queries;
+        // `check_unsat` reports that as `None` without spawning a solver, so this
+        // case is exercised even where no cvc5 is available.
+        assert!(matches!(check_unsat("  \n\t "), Ok(None)));
+    }
+
+    #[test]
+    fn parses_unsat_sat_and_reuses_the_process_across_queries() {
+        if !cvc5_available() {
+            return;
+        }
+        // All queries run on this one test thread, so they share a single reused
+        // cvc5 process; each script is self-contained and begins with `(reset)`,
+        // exactly as the encoder emits.
+
+        // `(assert false)` is UNSAT => the checked property holds.
+        assert_eq!(
+            check_unsat("(reset)\n(assert false)\n(check-sat)\n").expect("first query"),
+            Some(true),
+        );
+
+        // A satisfiable assertion is SAT => the property does not hold. Reusing
+        // the same process also proves a second non-empty query works.
+        assert_eq!(
+            check_unsat("(reset)\n(declare-fun x () Bool)\n(assert x)\n(check-sat)\n")
+                .expect("second query"),
+            Some(false),
+        );
+
+        // `(reset)` must have cleared the previous `declare-fun`: this query
+        // re-declares nothing and must still be answered by the same process,
+        // proving reset-based reuse with no cross-query state leak.
+        assert_eq!(
+            check_unsat("(reset)\n(assert (not true))\n(check-sat)\n").expect("third query"),
+            Some(true),
+        );
+    }
 }

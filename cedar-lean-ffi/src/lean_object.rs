@@ -225,11 +225,14 @@ impl OwnedLeanObject {
     /// they are never freed. A persistent object can then be read concurrently
     /// from multiple threads, since reference-count operations no longer race.
     ///
-    /// Precondition: call this before sharing the object across threads, and
-    /// while no other access to the same object graph is in progress. Marking
-    /// itself mutates the object headers, so it must not run concurrently with
-    /// other reads or writes of the graph; once marked, concurrent reads are safe.
-    pub fn mark_persistent(&self) {
+    /// # Safety
+    ///
+    /// Marking mutates the object headers across the whole reachable graph, so
+    /// the caller must ensure that no other access to that graph -- including
+    /// via aliases or [`Clone`]s of this `OwnedLeanObject` -- can occur
+    /// concurrently with this call. Mark the object before sharing it across
+    /// threads; once marked, concurrent reads are safe.
+    pub unsafe fn mark_persistent(&self) {
         // The object is reachable and well-formed; marking it persistent only
         // freezes its reference count and never frees memory early.
         unsafe { lean_mark_persistent(self.0) }
